@@ -4,16 +4,16 @@ import firebase_admin
 from firebase_admin import credentials, auth
 from dotenv import load_dotenv
 import os
+import json
 
 load_dotenv()
-FIREBASE_WEB_API_KEY = os.getenv("FIREBASE_WEB_API_KEY")#"***REDACTED***"
-
+FIREBASE_WEB_API_KEY = os.getenv("FIREBASE_WEB_API_KEY")
 _fb_app = None
 
 def _get_fb_app():
     global _fb_app
     if _fb_app is None:
-        cred = credentials.Certificate("secrets/cortex-2b256-firebase-adminsdk-fbsvc-b1e848b7fc.json")
+        cred = credentials.Certificate(json.loads(os.getenv("FIREBASE_ADMIN_SERVICE_ACCOUNT")))
         _fb_app = firebase_admin.initialize_app(cred, name="test")
     return _fb_app
 
