@@ -2,9 +2,11 @@ import requests
 import uuid
 import firebase_admin
 from firebase_admin import credentials, auth
+from dotenv import load_dotenv
+import os
 
-
-FIREBASE_WEB_API_KEY = "***REDACTED***"
+load_dotenv()
+FIREBASE_WEB_API_KEY = os.getenv("FIREBASE_WEB_API_KEY")#"***REDACTED***"
 
 _fb_app = None
 
