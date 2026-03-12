@@ -8,9 +8,12 @@ from firebase_admin import credentials, auth
 from google.cloud import bigquery
 from google.api_core.exceptions import BadRequest
 from pydantic import BaseModel
-
+from dotenv import load_dotenv
 from services.provisioning import provision_full_account, provision_clinic
+import json
+import os
 
+load_dotenv()
 
 # --- Request Models (what client sends) ---
 
@@ -127,17 +130,17 @@ class ProvisionRequest(BaseModel):
 
 
 
-bq_client = bigquery.Client.from_service_account_json(json_credentials_path="secrets/project-demo-2-482101-7c1c68a849ba.json")
-cred = credentials.Certificate("secrets/cortex-2b256-firebase-service_account.json")
+bq_client = bigquery.Client.from_service_account_info(json.loads(os.environ["GCS_SERVICE_ACCOUNT"]))
+cred = credentials.Certificate(json.loads(os.environ["FIREBASE_ADMIN_SERVICE_ACCOUNT"]))
 
 fb_app = firebase_admin.initialize_app(cred)
 app = FastAPI()
 
 bearer_scheme = HTTPBearer()
 
-PROJECT = "project-demo-2-482101"
-DATASET = "Users"
-INVOCA_NETWORK_ID = ""  # TODO: Add your Invoca network ID
+PROJECT = os.environ["GCP_PROJECT"]
+DATASET = os.environ["BQ_DATASET"]
+INVOCA_NETWORK_ID = os.environ.get("INVOCA_NETWORK_ID", "")  # Optional until implemented
 
 
 def bq_table(table: str) -> str:
