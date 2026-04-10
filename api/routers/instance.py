@@ -9,7 +9,7 @@ from api.deps import (
     verify_token, get_instance_id_for_uid, require_write_access,
 )
 from api.models import ProvisionRequest, InstanceUpdate
-from services.provisioning import provision_full_account
+from services.provisioning import provision_full_account, write_provision_to_bq
 
 router = APIRouter()
 
@@ -54,13 +54,13 @@ def provision_account(payload: ProvisionRequest, caller: dict = Depends(verify_t
         "insurance_id": str(uuid.uuid4()),
     }) for i in payload.insurance]
 
-    bq_insert("instances", [instance])
-    bq_insert("clinics", clinics)
-    bq_insert("staff", [s.model_dump() for s in staff])
-    if services:
-        bq_insert("services", [s.model_dump() for s in services])
-    if insurance:
-        bq_insert("insurance", [i.model_dump() for i in insurance])
+    write_provision_to_bq(
+        instance=instance,
+        clinics=clinics,
+        staff=[s.model_dump() for s in staff],
+        services=[s.model_dump() for s in services],
+        insurance=[i.model_dump() for i in insurance],
+    )
 
     return {
         "status": "success",

@@ -34,22 +34,17 @@ def auth_headers(uid: str) -> dict:
     return {"Authorization": f"Bearer {get_id_token(uid)}"}
 
 
-wills_uid = "gHo5k1SHAZhdGjN7q5OXqMVf7522"
 
 
 def provision_data(uid):
-    instance_id = str(uuid.uuid4())
     return {
     "instance": {
         "instance_name": "John Pork's Hearing Wonderland",
-        "invoca_id": "...",
-        "google_ads_id": "...",
         "primary_contact_name": "Dr. John Pork",
-        "primary_contact_uid": f"{uid}",
-        "instance_id": f"{instance_id}"
     },
     "clinics": [
         {
+        "ref_id": "clinic_cypress_nv_001",
         "clinic_name": "Test clinic 1",
         "address": "1450 Lonsdale Ave, North Vancouver, BC",
         "place_id": "ChIJN0northvan001",
@@ -61,8 +56,6 @@ def provision_data(uid):
         "hours_friday": "08:00-17:00",
         "hours_saturday": "10:00-14:00",
         "hours_sunday": "Closed",
-        "clinic_id": "clinic_cypress_nv_001",
-        "instance_id": f"{instance_id}",
         "phone": "(604) 555-0101",
         "parking_info": "Free parking available at the rear of the building.",
         "accessibility_info": "Wheelchair accessible entrance on the north side.",
@@ -71,6 +64,7 @@ def provision_data(uid):
         "transfer_number": "(604) 555-0102"
         },
         {
+        "ref_id": "clinic_cypress_bby_002",
         "clinic_name": "Test clinic 2",
         "address": "4100 Kingsway, Burnaby, BC",
         "place_id": "ChIJBurnabyKingsway002",
@@ -82,8 +76,6 @@ def provision_data(uid):
         "hours_friday": "09:00-16:00",
         "hours_saturday": "Closed",
         "hours_sunday": "Closed",
-        "clinic_id": "clinic_cypress_bby_002",
-        "instance_id": f"{instance_id}",
         "phone": "(604) 555-0201",
         "parking_info": "Street parking available on Kingsway.",
         "accessibility_info": "Elevator access available. Wheelchair accessible.",
@@ -100,7 +92,7 @@ def provision_data(uid):
         "clinic_id": "clinic_cypress_nv_001",
         "bio": "Specializes in spinal health, sports injuries, and long-term mobility optimization.",
         "years_experience": "7",
-        "instance_id": f"{instance_id}"
+        "instance_id": ""
         },
         {
         "name": "Sarah Mitchell",
@@ -109,7 +101,7 @@ def provision_data(uid):
         "clinic_id": "clinic_cypress_nv_001",
         "bio": "Focuses on post-operative rehab and athletic performance recovery.",
         "years_experience": "5",
-        "instance_id": f"{instance_id}"
+        "instance_id": ""
         },
         {
         "name": "Dr. Priya Nair",
@@ -118,37 +110,37 @@ def provision_data(uid):
         "clinic_id": "clinic_cypress_bby_002",
         "bio": "Experienced in musculoskeletal medicine and ultrasound-guided procedures.",
         "years_experience": "12",
-        "instance_id": f"{instance_id}"
+        "instance_id": ""
         }
     ],
     "services": [
         {
-        "service_id": "svc_001",
+        "service_id": "",
         "service_name": "Comprehensive Hearing Evaluation",
         "description": "Full diagnostic hearing assessment for adults.",
         "duration_minutes": "60",
         "cost": "75.00",
         "insurance_covered": "Alberta Blue Cross, most employer benefits",
         "clinic_id": "clinic_cypress_nv_001",
-        "instance_id": f"{instance_id}"
+        "instance_id": ""
         }
     ],
     "insurance": [
         {
-        "insurance_id": "ins_001",
+        "insurance_id": "",
         "plan_name": "Alberta Blue Cross",
         "provider_org": "Alberta Blue Cross",
         "notes": "Covers hearing evaluation in full under most plans.",
         "clinic_id": "clinic_cypress_nv_001",
-        "instance_id": f"{instance_id}"
+        "instance_id": ""
         },
         {
-        "insurance_id": "ins_002",
+        "insurance_id": "",
         "plan_name": "AADL",
         "provider_org": "Alberta Aids to Daily Living",
         "notes": "Covers hearing aids and assistive devices.",
         "clinic_id": "clinic_cypress_nv_001",
-        "instance_id": f"{instance_id}"
+        "instance_id": ""
         }
     ]
     }
@@ -166,8 +158,8 @@ def test(uid):
         "insurance": D["insurance"]
     })
     print(response.status_code)
-    print(response.json())
-    return D["instance"]["instance_id"]
+    print(response.text)
+    return response.json().get("instance_id")
 
 
 def test_delete(uid):
@@ -176,10 +168,14 @@ def test_delete(uid):
         headers=auth_headers(uid)
     )
     print(response.status_code)
-    print(response.json())
+    print(response.text)
 
 
+def test_add_clinic(uid):
+    response = requests.post()
 
-# test(real_uid)
-# instance_id = test(real_uid)
+
+wills_uid = "gHo5k1SHAZhdGjN7q5OXqMVf7522"
+
 test_delete(wills_uid)
+

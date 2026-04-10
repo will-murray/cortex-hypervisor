@@ -1,111 +1,63 @@
 """
 Provisioning orchestration.
 
-Handles the full flow of setting up a new instance with all external services.
+Handles the full flow of setting up a new instance.
+
+NOTE: BigQuery does not support multi-table transactions. write_provision_to_bq
+attempts best-effort compensating deletes on failure, but rows written to the
+streaming buffer cannot be deleted for up to 90 minutes.
 """
 import uuid
 from typing import List
-
-from integrations import invoca, google_ads
 
 
 def provision_instance(
     instance_name: str,
     primary_contact_name: str,
+    primary_contact_email: str,
     primary_contact_uid: str,
-    invoca_network_id: str,
 ) -> dict:
     """
-    Provision external services for a new instance.
-
-    Creates:
-    - Google Ads customer account
-    - Google Ads campaign
-    - Invoca profile
+    Create a new instance record.
 
     Returns:
-        dict with instance_id and all external service IDs
+        dict with instance_id and core fields
     """
-    instance_id = str(uuid.uuid4())
-
-    # Create Google Ads customer account
-    google_ads_customer_id = google_ads.create_customer(
-        customer_name=instance_name
-    )
-
-    # Create campaign under that account
-    google_ads_campaign_id = google_ads.create_campaign(
-        customer_id=google_ads_customer_id,
-        campaign_name=instance_name
-    )
-
-    # Create Invoca profile
-    invoca_profile_id = invoca.create_profile(
-        network_id=invoca_network_id,
-        profile_name=instance_name
-    )
-
-    return {
-        "instance_id": instance_id,
+    return {k: v for k, v in {
+        "instance_id": str(uuid.uuid4()),
         "instance_name": instance_name,
         "primary_contact_name": primary_contact_name,
+        "primary_contact_email": primary_contact_email,
         "primary_contact_uid": primary_contact_uid,
-        "google_ads_customer_id": google_ads_customer_id,
-        "google_ads_campaign_id": google_ads_campaign_id,
-        "invoca_profile_id": invoca_profile_id,
-    }
+        "google_ads_customer_id": None,
+        "invoca_profile_id": None,
+    }.items() if v is not None}
 
 
 def provision_clinic(
     clinic_data: dict,
     instance_id: str,
-    google_ads_customer_id: str,
-    google_ads_campaign_id: str,
-    invoca_profile_id: str,
 ) -> tuple[dict, str, str]:
     """
-    Provision external services for a new clinic.
-
-    Creates:
-    - Google Ads ad group under instance's campaign
-    - Invoca campaign under instance's profile
+    Create a new clinic record.
 
     Args:
         clinic_data: ClinicCreate fields as dict (includes ref_id)
         instance_id: Parent instance ID
-        google_ads_customer_id: Instance's Google Ads account
-        google_ads_campaign_id: Instance's campaign
-        invoca_profile_id: Instance's Invoca profile
 
     Returns:
         tuple of (clinic dict for storage, ref_id, clinic_id)
     """
     clinic_id = str(uuid.uuid4())
     ref_id = clinic_data.pop("ref_id", None)  # Remove ref_id, not stored in BigQuery
-    clinic_name = clinic_data["clinic_name"]
-    transfer_number = clinic_data["transfer_number"]
 
-    # Create Google Ads ad group
-    google_ads_ad_group_id = google_ads.create_ad_group(
-        customer_id=google_ads_customer_id,
-        campaign_id=google_ads_campaign_id,
-        ad_group_name=clinic_name
-    )
-
-    # Create Invoca campaign
-    invoca_campaign_id = invoca.create_campaign(
-        profile_id=invoca_profile_id,
-        campaign_name=clinic_name,
-        destination_number=transfer_number
-    )
-
-    clinic = {
+    clinic = {k: v for k, v in {
         **clinic_data,
         "clinic_id": clinic_id,
         "instance_id": instance_id,
-        "google_ads_ad_group_id": google_ads_ad_group_id,
-        "invoca_campaign_id": invoca_campaign_id,
-    }
+        "google_ads_campaign_id": None,
+        "invoca_campaign_id": None,
+    }.items() if v is not None}
 
     return clinic, ref_id, clinic_id
 
@@ -114,7 +66,6 @@ def provision_full_account(
     instance_create: dict,
     clinics_create: List[dict],
     primary_contact_uid: str,
-    invoca_network_id: str,
 ) -> dict:
     """
     Full provisioning flow for a new account.
@@ -123,7 +74,6 @@ def provision_full_account(
         instance_create: InstanceCreate fields as dict
         clinics_create: List of ClinicCreate fields as dicts (each with ref_id)
         primary_contact_uid: Firebase UID of the owner
-        invoca_network_id: Your Invoca network ID
 
     Returns:
         dict with:
@@ -131,24 +81,19 @@ def provision_full_account(
         - clinics: List of full clinic data for BigQuery
         - clinic_id_map: Mapping of ref_id -> clinic_id for linking staff/services/insurance
     """
-    # Provision instance-level resources
     instance = provision_instance(
         instance_name=instance_create["instance_name"],
         primary_contact_name=instance_create["primary_contact_name"],
+        primary_contact_email=instance_create["primary_contact_email"],
         primary_contact_uid=primary_contact_uid,
-        invoca_network_id=invoca_network_id,
     )
 
-    # Provision each clinic
     clinics = []
-    clinic_id_map = {}  # ref_id -> clinic_id
+    clinic_id_map = {}
     for clinic_data in clinics_create:
         clinic, ref_id, clinic_id = provision_clinic(
-            clinic_data=clinic_data.copy(),  # Copy to avoid mutating original
+            clinic_data=clinic_data.copy(),
             instance_id=instance["instance_id"],
-            google_ads_customer_id=instance["google_ads_customer_id"],
-            google_ads_campaign_id=instance["google_ads_campaign_id"],
-            invoca_profile_id=instance["invoca_profile_id"],
         )
         clinics.append(clinic)
         if ref_id:
@@ -159,3 +104,53 @@ def provision_full_account(
         "clinics": clinics,
         "clinic_id_map": clinic_id_map,
     }
+
+
+def write_provision_to_bq(
+    instance: dict,
+    clinics: list[dict],
+    staff: list[dict],
+    services: list[dict],
+    insurance: list[dict],
+) -> None:
+    """
+    Write provisioned account data to BigQuery in dependency order.
+
+    On failure, attempts best-effort compensating deletes of already-written tables.
+    Compensating deletes may not succeed if data is still in the streaming buffer.
+    """
+    from api.deps import bq_insert, bq_delete  # imported here to avoid circular import at module load
+
+    instance_id = instance["instance_id"]
+    _INSERT_ORDER = ["instances", "clinics", "staff", "services", "insurance"]
+    writes = {
+        "instances": [instance],
+        "clinics": clinics,
+        "staff": staff,
+        "services": services,
+        "insurance": insurance,
+    }
+    written: list[str] = []
+
+    try:
+        for table in _INSERT_ORDER:
+            rows = writes[table]
+            if rows:
+                bq_insert(table, rows)
+                written.append(table)
+    except Exception as exc:
+        next_table = next((t for t in _INSERT_ORDER if t not in written), "unknown")
+        _compensate(instance_id, written, bq_delete)
+        raise RuntimeError(
+            f"Provisioning failed on '{next_table}' insert. "
+            f"Attempted compensating deletes for: {written}."
+        ) from exc
+
+
+def _compensate(instance_id: str, written: list[str], bq_delete) -> None:
+    """Best-effort rollback — deletes rows by instance_id in reverse insert order."""
+    for table in reversed(written):
+        try:
+            bq_delete(table, {"instance_id": instance_id})
+        except Exception:
+            pass  # Streaming buffer — row cannot be deleted yet, log in production
