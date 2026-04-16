@@ -2,4 +2,8 @@ venv/
 __pycache__/
 *.pyc
 .env
+.env.bak
 secrets/
+blueprint_creds/
+feed_extracted/
+.claude
