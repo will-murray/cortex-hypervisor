@@ -332,8 +332,8 @@ class PatientCreate(BaseModel):
 
     @field_validator("patient_id", "instance_id", "clinic_id")
     @classmethod
-    def validate_required(cls, v):
-        return _require_non_empty(v, "field")
+    def validate_required(cls, v, info):
+        return _require_non_empty(v, info.field_name)
 
 
 class AppointmentCreate(BaseModel):
@@ -349,8 +349,8 @@ class AppointmentCreate(BaseModel):
 
     @field_validator("appointment_id", "patient_id", "instance_id", "clinic_id")
     @classmethod
-    def validate_required(cls, v):
-        return _require_non_empty(v, "field")
+    def validate_required(cls, v, info):
+        return _require_non_empty(v, info.field_name)
 
 
 class InvoiceCreate(BaseModel):
@@ -365,8 +365,8 @@ class InvoiceCreate(BaseModel):
 
     @field_validator("invoice_id", "patient_id", "instance_id", "clinic_id")
     @classmethod
-    def validate_required(cls, v):
-        return _require_non_empty(v, "field")
+    def validate_required(cls, v, info):
+        return _require_non_empty(v, info.field_name)
 
 
 class PhysicianReferralCreate(BaseModel):
@@ -381,8 +381,8 @@ class PhysicianReferralCreate(BaseModel):
 
     @field_validator("referral_id", "patient_id", "instance_id", "clinic_id")
     @classmethod
-    def validate_required(cls, v):
-        return _require_non_empty(v, "field")
+    def validate_required(cls, v, info):
+        return _require_non_empty(v, info.field_name)
 
 
 # --- Campaigns (multi-campaign per clinic) ---
@@ -411,12 +411,12 @@ class ClinicCampaign(BaseModel):
 
 class PmsConfigSet(BaseModel):
     """
-    Sets the PMS configuration for a clinic. blueprint_api_key is write-only
-    and is never returned in GET responses.
+    Sets the PMS configuration for a clinic.
+
+    Non-secret config goes in the `config` JSON field (shape varies by pms_type).
+    Secrets (api_key, aws creds) are passed in `secrets` and stored in
+    Google Secret Manager under pms/{clinic_id}/<key>, never in BigQuery.
     """
-    pms_type: Literal["none", "blueprint"]
-    blueprint_server: Optional[str] = None       # e.g. "wp2.bp-solutions.net:8443"
-    blueprint_clinic_slug: Optional[str] = None  # [CLINIC] path segment in Blueprint URLs
-    blueprint_api_key: Optional[str] = None      # stored in BQ, never returned
-    blueprint_location_id: Optional[int] = None  # numeric location ID
-    blueprint_user_id: Optional[int] = None      # service account user for API writes
+    pms_type: Literal["none", "blueprint", "auditdata"]
+    config: Optional[dict] = None     # PMS-specific non-secret settings (JSON)
+    secrets: Optional[dict] = None    # PMS-specific secrets — stored in SM, never returned

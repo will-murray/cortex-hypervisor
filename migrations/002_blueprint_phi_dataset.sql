@@ -1,32 +1,9 @@
--- Migration 002: Blueprint_PHI dataset + tables + feed credential columns
---
--- Run against: BigQuery
--- BigQuery does not support transactions — run each statement individually.
--- All table columns are STRING (Blueprint exports text CSVs).
---
--- Usage:
---   Substitute {GCP_PROJECT} with actual project ID before running.
---   Or run via the Python migration helper.
+-- Migration 002: Blueprint_PHI dataset + tables (regenerated from updated schemas)
+-- Run with: bq query --use_legacy_sql=false < 002_blueprint_phi_dataset.sql
+--   (substitute {GCP_PROJECT} first)
 
--- ── Feed credential columns on Users.clinics ─────────────────────────────
-
-ALTER TABLE `{GCP_PROJECT}.Users.clinics`
-  ADD COLUMN IF NOT EXISTS blueprint_s3_uri STRING
-    OPTIONS(description='S3 URI for Blueprint data feed ZIP'),
-  ADD COLUMN IF NOT EXISTS blueprint_aws_access_key_id STRING
-    OPTIONS(description='AWS access key ID for S3 feed download — migrate to Secret Manager (1-D)'),
-  ADD COLUMN IF NOT EXISTS blueprint_aws_secret_key STRING
-    OPTIONS(description='AWS secret key for S3 feed download — migrate to Secret Manager (1-D)'),
-  ADD COLUMN IF NOT EXISTS blueprint_aws_region STRING
-    OPTIONS(description='AWS region for S3 bucket, e.g. ca-central-1'),
-  ADD COLUMN IF NOT EXISTS blueprint_zip_password STRING
-    OPTIONS(description='Password for AES-encrypted feed ZIP — migrate to Secret Manager (1-D)');
-
--- ── Blueprint_PHI dataset ─────────────────────────────────────────────────
--- CREATE SCHEMA must be run separately:
+-- Create dataset first (via bq mk):
 --   bq mk --dataset --location=US {GCP_PROJECT}:Blueprint_PHI
-
--- ── Tables ────────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS `{GCP_PROJECT}.Blueprint_PHI.Accessories` (
   branch_id STRING,
@@ -77,7 +54,7 @@ CREATE TABLE IF NOT EXISTS `{GCP_PROJECT}.Blueprint_PHI.Appointments` (
   start_time STRING,
   end_time STRING,
   client_id STRING,
-  description STRING,
+  title STRING,
   notes STRING,
   status STRING,
   status_2 STRING,
@@ -87,8 +64,8 @@ CREATE TABLE IF NOT EXISTS `{GCP_PROJECT}.Blueprint_PHI.Appointments` (
   completed_time STRING,
   created_time STRING,
   sales_opportunity STRING,
-  referrer_type STRING,
-  referral_source STRING,
+  referrer_type_id STRING,
+  referral_source_id STRING,
   creator_id STRING,
   arrived_time_2 STRING,
   in_progress_time STRING,
@@ -210,6 +187,54 @@ CREATE TABLE IF NOT EXISTS `{GCP_PROJECT}.Blueprint_PHI.Batteries` (
   batterysize STRING,
   catalog_no STRING,
   cell_quantity STRING,
+  vendor_price STRING,
+  client_price STRING,
+  _clinic_id STRING,
+  _clinic_name STRING,
+  _snapshot_date STRING
+);
+
+CREATE TABLE IF NOT EXISTS `{GCP_PROJECT}.Blueprint_PHI.Claims` (
+  order_date STRING,
+  delivery_date STRING,
+  claim_id STRING,
+  status_id STRING,
+  order_id STRING,
+  invoice_number STRING,
+  order_total STRING,
+  trip_name STRING,
+  client_name STRING,
+  client_id STRING,
+  full_primary_insurer_name STRING,
+  full_secondary_insurer_name STRING,
+  primary_insurer_name STRING,
+  secondary_insurer_name STRING,
+  primary_insurer_claim_status STRING,
+  secondary_insurer_claim_status STRING,
+  pending_submission_amount STRING,
+  patient_balance_zero STRING,
+  submitted_date STRING,
+  submitted_amount STRING,
+  insurer_payment_amount STRING,
+  insurer_credit_amount STRING,
+  patient_payment_amount STRING,
+  patient_credit_amount STRING,
+  balance STRING,
+  to_be_submitted_to_insurance STRING,
+  patient_balance STRING,
+  claim_balance STRING,
+  _clinic_id STRING,
+  _clinic_name STRING,
+  _snapshot_date STRING
+);
+
+CREATE TABLE IF NOT EXISTS `{GCP_PROJECT}.Blueprint_PHI.ClaimsLineItems` (
+  branch_id STRING,
+  order_id STRING,
+  claim_id STRING,
+  item_id STRING,
+  item_type STRING,
+  client_price STRING,
   _clinic_id STRING,
   _clinic_name STRING,
   _snapshot_date STRING
@@ -234,6 +259,7 @@ CREATE TABLE IF NOT EXISTS `{GCP_PROJECT}.Blueprint_PHI.ClientAids` (
   client_id STRING,
   client_aid_id STRING,
   vendor_name STRING,
+  model_id STRING,
   model_name STRING,
   side STRING,
   serial_number STRING,
@@ -315,8 +341,8 @@ CREATE TABLE IF NOT EXISTS `{GCP_PROJECT}.Blueprint_PHI.ClientDemographics` (
   practitioner STRING,
   trip_name STRING,
   cash_sales_only STRING,
-  referrer_type STRING,
-  referral_source STRING,
+  referrer_type_id STRING,
+  referral_source_id STRING,
   note STRING,
   created_time STRING,
   modified_time STRING,
@@ -382,6 +408,7 @@ CREATE TABLE IF NOT EXISTS `{GCP_PROJECT}.Blueprint_PHI.ClientInsurerUS` (
   pre_certified STRING,
   hearing_aid_benefit STRING,
   insured_notes STRING,
+  sort_order STRING,
   _clinic_id STRING,
   _clinic_name STRING,
   _snapshot_date STRING
@@ -540,6 +567,7 @@ CREATE TABLE IF NOT EXISTS `{GCP_PROJECT}.Blueprint_PHI.ClientType` (
 CREATE TABLE IF NOT EXISTS `{GCP_PROJECT}.Blueprint_PHI.HearingAidModel` (
   branch_id STRING,
   vendor_name STRING,
+  model_id STRING,
   model_name STRING,
   catalog_no STRING,
   vendor_price STRING,
@@ -732,6 +760,7 @@ CREATE TABLE IF NOT EXISTS `{GCP_PROJECT}.Blueprint_PHI.InvoiceLineItems` (
   catalog_no STRING,
   client_aid_id STRING,
   item_type STRING,
+  prescriber_id STRING,
   _clinic_id STRING,
   _clinic_name STRING,
   _snapshot_date STRING
@@ -749,8 +778,10 @@ CREATE TABLE IF NOT EXISTS `{GCP_PROJECT}.Blueprint_PHI.InvoiceMaster` (
   total_tax STRING,
   returned STRING,
   amount_returned STRING,
-  referrer_type STRING,
-  referral_source STRING,
+  referrer_type_id STRING,
+  referral_source_id STRING,
+  sale_completed STRING,
+  practitioner_id STRING,
   _clinic_id STRING,
   _clinic_name STRING,
   _snapshot_date STRING
@@ -814,6 +845,16 @@ CREATE TABLE IF NOT EXISTS `{GCP_PROJECT}.Blueprint_PHI.Physician` (
   _snapshot_date STRING
 );
 
+CREATE TABLE IF NOT EXISTS `{GCP_PROJECT}.Blueprint_PHI.ReferralSources` (
+  type_id STRING,
+  source_id STRING,
+  type_desc STRING,
+  source_name STRING,
+  _clinic_id STRING,
+  _clinic_name STRING,
+  _snapshot_date STRING
+);
+
 CREATE TABLE IF NOT EXISTS `{GCP_PROJECT}.Blueprint_PHI.ReturnInvoiceApplications` (
   branch_id STRING,
   return_order_id STRING,
@@ -834,6 +875,7 @@ CREATE TABLE IF NOT EXISTS `{GCP_PROJECT}.Blueprint_PHI.ReturnLineItems` (
   return_price STRING,
   return_discount STRING,
   item_type STRING,
+  return_reason STRING,
   _clinic_id STRING,
   _clinic_name STRING,
   _snapshot_date STRING
@@ -920,4 +962,3 @@ CREATE TABLE IF NOT EXISTS `{GCP_PROJECT}.Blueprint_PHI.User` (
   _clinic_name STRING,
   _snapshot_date STRING
 );
-

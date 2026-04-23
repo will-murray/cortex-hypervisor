@@ -1,7 +1,6 @@
 import json
 import os
 
-from dotenv import load_dotenv
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import firebase_admin
@@ -9,13 +8,17 @@ from firebase_admin import credentials, auth
 from google.api_core.exceptions import BadRequest
 from google.cloud import bigquery
 
-load_dotenv(dotenv_path=".env")
+from services.secrets import get_secret
 
-PROJECT = os.environ["GCP_PROJECT"]
-DATASET = os.environ["BQ_DATASET"]
+PROJECT = "project-demo-2-482101"
+DATASET = "Users"
 
-bq_client = bigquery.Client.from_service_account_info(json.loads(os.environ["GCS_SERVICE_ACCOUNT"]))
-_cred = credentials.Certificate(json.loads(os.environ["FIREBASE_ADMIN_SERVICE_ACCOUNT"]))
+# BigQuery: uses Application Default Credentials (ADC)
+bq_client = bigquery.Client(project=PROJECT)
+
+# Firebase Admin: SA lives in Secret Manager (different GCP project — cortex-2b256)
+_firebase_sa = json.loads(get_secret("firebase-admin-service-account"))
+_cred = credentials.Certificate(_firebase_sa)
 firebase_admin.initialize_app(_cred)
 
 bearer_scheme = HTTPBearer()

@@ -7,8 +7,11 @@ NOTE: BigQuery does not support multi-table transactions. write_provision_to_bq
 attempts best-effort compensating deletes on failure, but rows written to the
 streaming buffer cannot be deleted for up to 90 minutes.
 """
+import logging
 import uuid
 from typing import List
+
+log = logging.getLogger(__name__)
 
 
 def provision_instance(
@@ -148,9 +151,18 @@ def write_provision_to_bq(
 
 
 def _compensate(instance_id: str, written: list[str], bq_delete) -> None:
-    """Best-effort rollback — deletes rows by instance_id in reverse insert order."""
+    """Best-effort rollback — deletes rows by instance_id in reverse insert order.
+
+    Failures are logged but not raised; partial cleanup is expected because of
+    BigQuery's streaming buffer (90-minute delay before rows can be deleted).
+    """
     for table in reversed(written):
         try:
             bq_delete(table, {"instance_id": instance_id})
-        except Exception:
-            pass  # Streaming buffer — row cannot be deleted yet, log in production
+            log.warning("Compensated: deleted %s rows for instance_id=%s", table, instance_id)
+        except Exception as e:
+            log.error(
+                "Compensating delete FAILED for table=%s instance_id=%s: %s. "
+                "Manual cleanup may be required once the streaming buffer clears.",
+                table, instance_id, e,
+            )

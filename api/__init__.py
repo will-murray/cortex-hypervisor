@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from api.routers import (
     instance, clinics, staff, services, insurance, users,
     appointment_types, review_snapshots,
-    voice_agent, pms_config, campaigns,
+    voice_agent, pms_config, campaigns, blueprint, agent_script,
 )
 
 app = FastAPI()
@@ -39,3 +39,5 @@ app.include_router(review_snapshots.router)
 app.include_router(voice_agent.router)
 app.include_router(pms_config.router)
 app.include_router(campaigns.router)
+app.include_router(blueprint.router)
+app.include_router(agent_script.router)

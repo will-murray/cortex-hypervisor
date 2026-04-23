@@ -21,6 +21,20 @@ def get_clinics(instance_id: str, caller: dict = Depends(verify_token)):
     ).result())
     return [dict(r) for r in rows]
 
+@router.get("/clinics/{instance_id}/{clinic_id}")
+def get_clinic(instance_id: str, clinic_id: str, caller: dict = Depends(verify_token)):
+    require_read_access(instance_id, caller)
+    
+    rows = list(bq_client.query(
+        f"SELECT * FROM {bq_table('clinics')} WHERE instance_id = @instance_id AND clinic_id = @clinic_id",
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("instance_id", "STRING", instance_id),
+            bigquery.ScalarQueryParameter("clinic_id", "STRING", clinic_id)
+        ])
+    ).result())
+    if not rows:
+        raise HTTPException(status_code=404, detail="Clinic not found")
+    return dict(rows[0])
 
 @router.post("/clinics/{instance_id}")
 def add_clinic(instance_id: str, clinic: ClinicCreate, caller: dict = Depends(verify_token)):

@@ -16,7 +16,7 @@ import os
 from google.cloud import secretmanager
 
 _client = secretmanager.SecretManagerServiceClient()
-_project = os.environ["GCP_PROJECT"]
+_project = "project-demo-2-482101"
 
 
 @lru_cache(maxsize=None)

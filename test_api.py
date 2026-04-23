@@ -1,19 +1,27 @@
+"""
+Manual integration test script for the hypervisor API.
+
+Not a pytest file — contains interactive calls that hit a running `uvicorn api:app`
+instance and mutate BigQuery. Run parts of this manually; do not import.
+
+Credentials come from Google Secret Manager via services.secrets.
+"""
 import requests
 import uuid
 import firebase_admin
 from firebase_admin import credentials, auth
-from dotenv import load_dotenv
-import os
 import json
 
-load_dotenv()
-FIREBASE_WEB_API_KEY = os.getenv("FIREBASE_WEB_API_KEY")
+from services.secrets import get_secret
+
+FIREBASE_WEB_API_KEY = get_secret("firebase-web-api-key")
 _fb_app = None
+
 
 def _get_fb_app():
     global _fb_app
     if _fb_app is None:
-        cred = credentials.Certificate(json.loads(os.getenv("FIREBASE_ADMIN_SERVICE_ACCOUNT")))
+        cred = credentials.Certificate(json.loads(get_secret("firebase-admin-service-account")))
         _fb_app = firebase_admin.initialize_app(cred, name="test")
     return _fb_app
 
@@ -171,11 +179,9 @@ def test_delete(uid):
     print(response.text)
 
 
-def test_add_clinic(uid):
-    response = requests.post()
-
-
-wills_uid = "gHo5k1SHAZhdGjN7q5OXqMVf7522"
-
-test_delete(wills_uid)
-
+if __name__ == "__main__":
+    # Module-level test invocations — only runs when the script is executed
+    # directly. Importing this file (e.g. pytest collecting it) won't mutate
+    # production data.
+    wills_uid = "gHo5k1SHAZhdGjN7q5OXqMVf7522"
+    test_delete(wills_uid)
