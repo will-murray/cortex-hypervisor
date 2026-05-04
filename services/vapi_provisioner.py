@@ -5,24 +5,30 @@ Handles creating, updating, and deleting VAPI voice agents on behalf of the
 activate/deactivate API endpoints. Builds system prompts from BigQuery clinic
 data directly — no dependency on voice_agent_builder package.
 
+Credentials are read from Secret Manager:
+    vapi-api-key
+    vapi-webhook-secret
+    twilio-account-sid
+    twilio-auth-token
+
 Environment variables:
-    VAPI_API_KEY
     CORTEX_API_BASE_URL   Public URL of this API (used in VAPI tool definitions)
-    VAPI_WEBHOOK_SECRET   Shared secret for VAPI → cortex-hypervisor tool calls
 """
-import datetime
 import json
 import os
 
 import httpx
 from google.cloud import bigquery
 
+from services.locale import resolve as resolve_locale
+from services.secrets import get_secret
+
 VAPI_BASE = "https://api.vapi.ai"
 
 
 def _headers() -> dict:
     return {
-        "Authorization": f"Bearer {os.environ['VAPI_API_KEY']}",
+        "Authorization": f"Bearer {get_secret('vapi-api-key')}",
         "Content-Type": "application/json",
     }
 
@@ -32,7 +38,7 @@ def _headers() -> dict:
 def _build_tools(clinic_id: str, pms_type: str) -> list[dict]:
     """Build VAPI tool definitions based on the clinic's PMS type."""
     base = os.environ.get("CORTEX_API_BASE_URL", "http://localhost:8000")
-    secret = os.environ.get("VAPI_WEBHOOK_SECRET", "")
+    secret = get_secret("vapi-webhook-secret")
 
     if pms_type != "blueprint":
         return []
@@ -123,7 +129,7 @@ def _build_tools(clinic_id: str, pms_type: str) -> list[dict]:
     ]
 
 
-def _build_system_prompt(clinic: dict, faqs: list, appt_types: list) -> str:
+def _build_system_prompt(clinic: dict, faqs: list, appt_types: list, locale: dict) -> str:
     pms_type = clinic.get("pms_type", "none")
     has_booking = pms_type == "blueprint"
 
@@ -161,7 +167,7 @@ appointment type, name, and phone number. Let them know the clinic will call bac
 The clinic uses {clinic.get("booking_system", "their scheduling system")} for scheduling.
 """
 
-    return f"""The date today is {datetime.datetime.now().strftime("%Y-%m-%d")}.
+    return f"""{locale["prompt_block"]}
 
 You are a friendly and professional receptionist at {clinic["clinic_name"]}.
 Your job is to assist callers by answering questions about the clinic, providing
@@ -178,7 +184,7 @@ information about services, and helping with appointment bookings.
 - Parking: {clinic["parking_info"]}
 - Accessibility: {clinic["accessibility_info"]}
 
-## Hours of Operation (Timezone: {clinic["timezone"]})
+## Hours of Operation
 - Monday: {clinic["hours_monday"]}
 - Tuesday: {clinic["hours_tuesday"]}
 - Wednesday: {clinic["hours_wednesday"]}
@@ -295,8 +301,8 @@ def import_twilio_number(twilio_phone_number: str, twilio_sid: str) -> str:
         json={
             "provider": "twilio",
             "number": twilio_phone_number,
-            "twilioAccountSid": os.environ["TWILIO_ACCOUNT_SID"],
-            "twilioAuthToken": os.environ["TWILIO_AUTH_TOKEN"],
+            "twilioAccountSid": get_secret("twilio-account-sid"),
+            "twilioAuthToken": get_secret("twilio-auth-token"),
         },
         timeout=30,
     )
@@ -314,6 +320,7 @@ def create_assistant(bq_client: bigquery.Client, clinic_id: str, phone_number_id
     clinic = _fetch_clinic_data(bq_client, clinic_id)
     faqs = _fetch_faqs(bq_client, clinic_id)
     pms_type = clinic.get("pms_type", "none")
+    locale = resolve_locale(clinic)
 
     if pms_type == "blueprint":
         # Fetch appointment types from Blueprint directly — these include the
@@ -322,7 +329,7 @@ def create_assistant(bq_client: bigquery.Client, clinic_id: str, phone_number_id
     else:
         appt_types = _fetch_appt_types(bq_client, clinic_id)
 
-    system_prompt = _build_system_prompt(clinic, faqs, appt_types)
+    system_prompt = _build_system_prompt(clinic, faqs, appt_types, locale)
     tools = _build_tools(clinic_id, pms_type)
 
     model_config = {
@@ -338,6 +345,11 @@ def create_assistant(bq_client: bigquery.Client, clinic_id: str, phone_number_id
         "firstMessage": f"You've reached {clinic['clinic_name']}, how can I assist you today?",
         "firstMessageInterruptionsEnabled": True,
         "model": model_config,
+        "transcriber": {
+            "provider": "deepgram",
+            "model": "nova-2",
+            "language": locale["transcriber_language"],
+        },
         "phoneNumberId": phone_number_id,
     }
 

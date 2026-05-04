@@ -4,9 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.routers import (
-    instance, clinics, staff, services, insurance, users,
-    appointment_types, review_snapshots,
-    voice_agent, pms_config, campaigns, blueprint, agent_script,
+    instance, clinics, voice_agent, pms_config, campaigns, blueprint,
 )
 
 app = FastAPI()
@@ -30,14 +28,7 @@ def hello():
 
 app.include_router(instance.router)
 app.include_router(clinics.router)
-app.include_router(staff.router)
-app.include_router(services.router)
-app.include_router(insurance.router)
-app.include_router(users.router)
-app.include_router(appointment_types.router)
-app.include_router(review_snapshots.router)
 app.include_router(voice_agent.router)
 app.include_router(pms_config.router)
 app.include_router(campaigns.router)
 app.include_router(blueprint.router)
-app.include_router(agent_script.router)

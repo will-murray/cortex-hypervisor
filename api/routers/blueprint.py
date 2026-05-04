@@ -145,6 +145,13 @@ class AvailabilityRequest(BaseModel):
     end_date: str     # YYYY-MM-DD
 
 
+class AvailabilitySearchRequest(BaseModel):
+    start_date: str                              # YYYY-MM-DD (clinic local time)
+    end_date: str                                # YYYY-MM-DD (clinic local time, inclusive)
+    locations: list[int] | None = None           # defaults to the clinic's configured location
+    available_for_online_booking_only: bool | None = None
+
+
 class CreateAppointmentRequest(BaseModel):
     event_type_id: int
     start_time: str
@@ -155,6 +162,14 @@ class CreateAppointmentRequest(BaseModel):
     first_name: str | None = None
     last_name: str | None = None
     phone: str | None = None
+
+
+class FindAvailableSlotsRequest(BaseModel):
+    event_type_id: int
+    start_date: str   # YYYY-MM-DD (clinic local time)
+    end_date: str     # YYYY-MM-DD (clinic local time, inclusive)
+    providers: list[int] | None = None
+    locations: list[int] | None = None
 
 
 # ── Admin endpoint ────────────────────────────────────────────────────────────
@@ -269,6 +284,179 @@ def check_availability(
     resp = httpx.get(f"{base}/availability/", params=params, timeout=15)
     resp.raise_for_status()
     return resp.json()
+
+
+@router.post("/{clinic_id}/availability/search")
+def search_availability(
+    clinic_id: str,
+    body: AvailabilitySearchRequest,
+    _: None = Depends(verify_vapi_secret),
+):
+    """
+    Search scheduled provider availability blocks in a date range.
+
+    Proxies Blueprint: POST /rest/availability/search. Returns summary info
+    about availability blocks (when providers are scheduled to work) — NOT
+    bookable appointment slots. Use `check_availability` for bookable slots
+    tied to a specific event type; use this endpoint for broad "when does the
+    clinic have capacity next week?" questions.
+    """
+    config = _get_blueprint_config(clinic_id)
+    base = _blueprint_base(config)
+
+    tz = ZoneInfo(config.get("timezone") or "America/Vancouver")
+    start_dt = datetime.strptime(body.start_date, "%Y-%m-%d").replace(tzinfo=tz)
+    end_dt = (datetime.strptime(body.end_date, "%Y-%m-%d") + timedelta(days=1)).replace(tzinfo=tz)
+
+    payload: dict = {
+        "apiKey": config["api_key"],
+        "startTime": int(start_dt.timestamp()),
+        "endTime": int(end_dt.timestamp()),
+    }
+
+    # If the caller didn't specify locations, fall back to the clinic's
+    # configured location_id. Matches check_availability's behaviour.
+    if body.locations is not None:
+        payload["locations"] = body.locations
+    else:
+        location_id = _int_field(config, "location_id")
+        if location_id:
+            payload["locations"] = [location_id]
+
+    if body.available_for_online_booking_only is not None:
+        payload["availableForOnlineBookingOnly"] = body.available_for_online_booking_only
+
+    resp = httpx.post(f"{base}/availability/search", json=payload, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+# ── Voice agent v1: list_appointment_types + find_available_slots ─────────────
+
+
+# Hardcoded for v1. /clinicConfiguration also returns these per-clinic, but we
+# default to platform-wide values to avoid the extra Blueprint round-trip.
+# If a clinic needs different defaults, lift these into clinic_pms_config.
+_DEFAULT_BOOKING_TIME_SLOT_INTERVAL = "30"     # minutes; "60" / "30" / "15" / "DURATION"
+_DEFAULT_MINIMUM_ADVANCE_BOOKING_TIME = 30      # minutes
+
+
+@router.post("/{clinic_id}/appointment-types")
+def list_appointment_types(
+    clinic_id: str,
+    _: None = Depends(verify_vapi_secret),
+):
+    """
+    Voice-agent capability: list the clinic's bookable appointment types.
+
+    Hits Blueprint's GET /rest/clinicConfiguration/ and returns a stripped
+    list — just id, name, and duration_minutes. The agent uses this to map a
+    caller's stated need to an event_type_id before calling
+    find_available_slots.
+
+    Strips: providers, locations, configuration knobs, requiredResourceTypeIds,
+    description (often empty / verbose).
+    """
+    config = _get_blueprint_config(clinic_id)
+    base = _blueprint_base(config)
+
+    resp = httpx.get(
+        f"{base}/clinicConfiguration/",
+        params={"apiKey": config["api_key"]},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Filter out null-named placeholder rows. Blueprint returns the full
+    # appointmentTypes pool (active + inactive + deleted) with name=null on
+    # anything not currently in use. The agent can't reason about anonymous
+    # IDs, so drop them. We keep entries that have a name regardless of the
+    # active/onlineBookingEnabled flags — clinics in mid-configuration may
+    # still want their types surfaced; staff handle the activation separately.
+    return {
+        "appointment_types": [
+            {
+                "id": t["id"],
+                "name": t.get("name"),
+                "duration_minutes": t.get("duration"),
+            }
+            for t in data.get("appointmentTypes", [])
+            if t.get("name")
+        ],
+    }
+
+
+@router.post("/{clinic_id}/availability/find")
+def find_available_slots(
+    clinic_id: str,
+    body: FindAvailableSlotsRequest,
+    _: None = Depends(verify_vapi_secret),
+):
+    """
+    Voice-agent capability: find concrete bookable time slots in a date range
+    for a specific appointment type.
+
+    Proxies Blueprint's GET /rest/availability/?... Hardcodes the booking
+    interval and minimum-advance-booking values; the agent doesn't need to
+    care about those.
+
+    Response is aggressively stripped — only date + bookable times remain. No
+    provider IDs, no location IDs, no resource info reach the agent. The
+    agent's job is to capture preference; clinic staff confirm the actual
+    provider / location at booking time.
+    """
+    config = _get_blueprint_config(clinic_id)
+    base = _blueprint_base(config)
+
+    tz = ZoneInfo(config.get("timezone") or "America/Vancouver")
+    start_dt = datetime.strptime(body.start_date, "%Y-%m-%d").replace(tzinfo=tz)
+    end_dt = (datetime.strptime(body.end_date, "%Y-%m-%d") + timedelta(days=1)).replace(tzinfo=tz)
+
+    params: dict = {
+        "apiKey": config["api_key"],
+        "startTime": int(start_dt.timestamp()),
+        "endTime": int(end_dt.timestamp()),
+        "eventTypeId": body.event_type_id,
+        "bookingTimeSlotInterval": _DEFAULT_BOOKING_TIME_SLOT_INTERVAL,
+        "minimumAdvanceBookingTime": _DEFAULT_MINIMUM_ADVANCE_BOOKING_TIME,
+    }
+
+    if body.providers is not None:
+        params["providers"] = ",".join(str(p) for p in body.providers)
+    if body.locations is not None:
+        params["locations"] = ",".join(str(loc) for loc in body.locations)
+    else:
+        clinic_location_id = _int_field(config, "location_id")
+        if clinic_location_id:
+            params["locations"] = clinic_location_id
+
+    resp = httpx.get(f"{base}/availability/", params=params, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Strip: keep date + the time strings only. Drop providerId/locationId
+    # arrays and resource info. Skip days flagged unavailable.
+    days = []
+    for day in data:
+        if not day.get("available"):
+            continue
+        times = []
+        for slot in day.get("availabilityTimes", []) or []:
+            t = slot.get("time")
+            if not t:
+                continue
+            # Trim "08:00:00-0600" → "08:00"
+            hhmm = t.split(":")
+            if len(hhmm) >= 2:
+                times.append(f"{hhmm[0]}:{hhmm[1]}")
+            else:
+                times.append(t)
+        if not times:
+            continue
+        days.append({"date": day.get("date"), "available_times": times})
+
+    return {"days": days}
 
 
 @router.post("/{clinic_id}/appointment")

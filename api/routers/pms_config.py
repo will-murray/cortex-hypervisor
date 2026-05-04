@@ -1,228 +1,185 @@
 """
-PMS configuration — per clinic, PMS-agnostic.
+PMS configuration — per-clinic, typed per PMS.
 
-Non-secret config lives in Users.clinic_pms_config (JSON `config` column).
-Secrets (API keys, AWS creds) live in Google Secret Manager under
-pms/{clinic_id}/<secret-name>.
+Non-secret config lives in Cloud SQL:
+    blueprint  → clinic_blueprint_config (clinic_code, api_url, aws_url)
+    audit_data → reserved; clinic_audit_data_config will be added when the
+                 AuditData integration lands.
 
-Supported pms_type values: "none", "blueprint", "auditdata"
+Secrets live in Google Secret Manager and never touch the DB. Naming convention
+matches what the ETL pipeline reads:
+    clinic_{clinic_id}_blueprint_api_key
+    clinic_{clinic_id}_blueprint_aws_access_key_id
+    clinic_{clinic_id}_blueprint_aws_secret_access_key
+    clinic_{clinic_id}_blueprint_zip_password
 """
-import json
-import subprocess
-
 from fastapi import APIRouter, Depends, HTTPException
-from google.cloud import bigquery
+from sqlalchemy.orm import Session
 
-from api.deps import (
-    bq_client, bq_table, bq_update,
-    verify_token, require_read_access, require_write_access,
-)
+from api.deps import require_read_access, require_write_access, verify_token
 from api.models import PmsConfigSet
+from services.db import get_session
+from services.models import Clinic, ClinicBlueprintConfig
 from services.secrets import get_secret
+
 
 router = APIRouter()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _get_clinic_or_404(clinic_id: str) -> dict:
-    rows = list(bq_client.query(
-        f"SELECT * FROM {bq_table('clinics')} WHERE clinic_id = @clinic_id",
-        job_config=bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ScalarQueryParameter("clinic_id", "STRING", clinic_id)
-        ])
-    ).result())
-    if not rows:
+def _get_clinic_or_404(db: Session, clinic_id: str) -> Clinic:
+    clinic = db.get(Clinic, clinic_id)
+    if not clinic or clinic.deleted_at is not None:
         raise HTTPException(status_code=404, detail="Clinic not found")
-    return dict(rows[0])
+    return clinic
 
 
-def _get_pms_config(clinic_id: str) -> dict | None:
-    """Fetch the clinic_pms_config row, or None if not configured."""
-    rows = list(bq_client.query(
-        f"SELECT * FROM {bq_table('clinic_pms_config')} WHERE clinic_id = @clinic_id",
-        job_config=bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ScalarQueryParameter("clinic_id", "STRING", clinic_id)
-        ])
-    ).result())
-    if not rows:
-        return None
-    row = dict(rows[0])
-    row["config"] = json.loads(row["config"]) if row.get("config") else {}
-    return row
+def _sm_secret_name(clinic_id: str, pms_type: str, key: str) -> str:
+    return f"clinic_{clinic_id}_{pms_type}_{key}"
 
 
-def _sm_secret_name(clinic_id: str, key: str) -> str:
-    """Build the Secret Manager secret name for a per-clinic PMS secret."""
-    return f"pms--{clinic_id}--{key}"
-
-
-def _read_pms_secret(clinic_id: str, key: str) -> str | None:
-    """Read a per-clinic PMS secret from SM. Returns None if not found."""
-    try:
-        return get_secret(_sm_secret_name(clinic_id, key))
-    except Exception:
-        return None
-
-
-def _write_pms_secret(clinic_id: str, key: str, value: str):
-    """Write a per-clinic PMS secret to SM (create or add version)."""
-    import os
+def _write_pms_secret(clinic_id: str, pms_type: str, key: str, value: str) -> None:
+    """Write a per-clinic PMS secret to SM (create or add a new version)."""
     from google.cloud import secretmanager
 
-    project = os.environ["GCP_PROJECT"]
-    sm_client = secretmanager.SecretManagerServiceClient()
-    secret_id = _sm_secret_name(clinic_id, key)
+    sm = secretmanager.SecretManagerServiceClient()
+    secret_id = _sm_secret_name(clinic_id, pms_type, key)
+    project = "project-demo-2-482101"  # mirrors services/secrets.py
     parent = f"projects/{project}"
     secret_path = f"{parent}/secrets/{secret_id}"
 
     try:
-        sm_client.get_secret(request={"name": secret_path})
-        # Secret exists — add a new version
-        sm_client.add_secret_version(
+        sm.get_secret(request={"name": secret_path})
+        sm.add_secret_version(
             request={"parent": secret_path, "payload": {"data": value.encode("utf-8")}}
         )
     except Exception:
-        # Secret doesn't exist — create it
-        sm_client.create_secret(
-            request={"parent": parent, "secret_id": secret_id, "secret": {"replication": {"automatic": {}}}}
+        sm.create_secret(
+            request={
+                "parent": parent,
+                "secret_id": secret_id,
+                "secret": {"replication": {"automatic": {}}},
+            }
         )
-        sm_client.add_secret_version(
+        sm.add_secret_version(
             request={"parent": secret_path, "payload": {"data": value.encode("utf-8")}}
         )
-    # Clear the lru_cache so subsequent reads see the new value
+    # Force any cached read of the previous version to refresh.
     get_secret.cache_clear()
 
 
-def _delete_pms_secrets(clinic_id: str, keys: list[str]):
-    """Delete per-clinic PMS secrets from SM."""
-    import os
-    from google.cloud import secretmanager
+# ── Per-PMS config column maps ────────────────────────────────────────────────
 
-    project = os.environ["GCP_PROJECT"]
-    sm_client = secretmanager.SecretManagerServiceClient()
-
-    for key in keys:
-        secret_path = f"projects/{project}/secrets/{_sm_secret_name(clinic_id, key)}"
-        try:
-            sm_client.delete_secret(request={"name": secret_path})
-        except Exception:
-            pass  # Already gone
-    get_secret.cache_clear()
-
-
-# ── Known secret keys per PMS type ────────────────────────────────────────────
-
-_PMS_SECRET_KEYS: dict[str, list[str]] = {
-    "blueprint": ["api-key", "aws-access-key-id", "aws-secret-access-key", "zip-password"],
-    "auditdata": ["api-key"],
-}
+_BLUEPRINT_CONFIG_FIELDS = {"clinic_code", "api_url", "aws_url"}
+_BLUEPRINT_SECRET_KEYS = (
+    "api_key", "aws_access_key_id", "aws_secret_access_key", "zip_password",
+)
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.get("/clinics/{clinic_id}/pms")
-def get_pms_config(clinic_id: str, caller: dict = Depends(verify_token)):
-    """
-    Returns the PMS configuration for a clinic.
-    Secrets are never returned — only non-secret config from clinic_pms_config.
-    """
-    clinic = _get_clinic_or_404(clinic_id)
-    require_read_access(clinic["instance_id"], caller)
+def get_pms_config(
+    clinic_id: str,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Returns the PMS configuration for a clinic. Secrets are never returned."""
+    clinic = _get_clinic_or_404(db, clinic_id)
+    require_read_access(clinic.instance_id, caller)
 
-    pms = _get_pms_config(clinic_id)
-    if not pms:
-        return {"pms_type": clinic.get("pms_type", "none"), "config": {}}
+    pms_type = clinic.pms_type or "none"
+    if pms_type == "blueprint":
+        bp = db.get(ClinicBlueprintConfig, clinic_id)
+        config = {
+            "clinic_code": bp.clinic_code if bp else None,
+            "api_url": bp.api_url if bp else None,
+            "aws_url": bp.aws_url if bp else None,
+        } if bp else {}
+    else:
+        config = {}
 
-    return {
-        "pms_type": pms["pms_type"],
-        "config": pms["config"],
-    }
+    return {"pms_type": pms_type, "config": config}
 
 
 @router.post("/clinics/{clinic_id}/pms")
-def set_pms_config(clinic_id: str, body: PmsConfigSet, caller: dict = Depends(verify_token)):
-    """
-    Set or replace the PMS configuration for a clinic.
+def set_pms_config(
+    clinic_id: str,
+    body: PmsConfigSet,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Set or replace the PMS configuration for a clinic."""
+    clinic = _get_clinic_or_404(db, clinic_id)
+    require_write_access(clinic.instance_id, caller)
 
-    `config` is a JSON object with PMS-specific non-secret settings.
-    `secrets` is a JSON object with PMS-specific secrets (stored in SM, never in BQ).
-    """
-    clinic = _get_clinic_or_404(clinic_id)
-    require_write_access(clinic["instance_id"], caller)
+    config = body.config or {}
 
-    config_json = json.dumps(body.config or {})
+    if body.pms_type == "blueprint":
+        unknown = set(config.keys()) - _BLUEPRINT_CONFIG_FIELDS
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown blueprint config fields: {sorted(unknown)}",
+            )
 
-    # Upsert clinic_pms_config row
-    existing = _get_pms_config(clinic_id)
-    if existing:
-        # Update
-        bq_client.query(
-            f"UPDATE {bq_table('clinic_pms_config')} "
-            f"SET pms_type = @pms_type, config = @config "
-            f"WHERE clinic_id = @clinic_id",
-            job_config=bigquery.QueryJobConfig(query_parameters=[
-                bigquery.ScalarQueryParameter("pms_type", "STRING", body.pms_type),
-                bigquery.ScalarQueryParameter("config", "STRING", config_json),
-                bigquery.ScalarQueryParameter("clinic_id", "STRING", clinic_id),
-            ])
-        ).result()
-    else:
-        # Insert
-        bq_client.query(
-            f"INSERT INTO {bq_table('clinic_pms_config')} (clinic_id, pms_type, config) "
-            f"VALUES (@clinic_id, @pms_type, @config)",
-            job_config=bigquery.QueryJobConfig(query_parameters=[
-                bigquery.ScalarQueryParameter("clinic_id", "STRING", clinic_id),
-                bigquery.ScalarQueryParameter("pms_type", "STRING", body.pms_type),
-                bigquery.ScalarQueryParameter("config", "STRING", config_json),
-            ])
-        ).result()
+        bp = db.get(ClinicBlueprintConfig, clinic_id)
+        if bp is None:
+            bp = ClinicBlueprintConfig(clinic_id=clinic_id)
+            db.add(bp)
+        for field in _BLUEPRINT_CONFIG_FIELDS:
+            if field in config:
+                setattr(bp, field, config[field])
 
-    # Update pms_type on the clinics table too (used for agent_factory tool selection)
-    bq_update("clinics", {"clinic_id": clinic_id}, {"pms_type": body.pms_type})
+        if body.secrets:
+            unknown_secrets = set(body.secrets.keys()) - set(_BLUEPRINT_SECRET_KEYS)
+            if unknown_secrets:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unknown blueprint secret keys: {sorted(unknown_secrets)}",
+                )
+            for key, value in body.secrets.items():
+                if value:
+                    _write_pms_secret(clinic_id, "blueprint", key, str(value))
 
-    # Store secrets in SM
-    if body.secrets:
-        for key, value in body.secrets.items():
-            if value:
-                _write_pms_secret(clinic_id, key, str(value))
+    elif body.pms_type == "audit_data":
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "AuditData PMS support is not yet implemented. "
+                "clinic_audit_data_config will be added when AuditData lands."
+            ),
+        )
 
-    return {
-        "status": "success",
-        "clinic_id": clinic_id,
-        "pms_type": body.pms_type,
-    }
+    elif body.pms_type == "none":
+        # Clear blueprint config if any. Secrets remain in SM as backup.
+        bp = db.get(ClinicBlueprintConfig, clinic_id)
+        if bp is not None:
+            db.delete(bp)
+
+    clinic.pms_type = body.pms_type
+
+    return {"status": "success", "clinic_id": clinic_id, "pms_type": body.pms_type}
 
 
 @router.delete("/clinics/{clinic_id}/pms")
-def clear_pms_config(clinic_id: str, caller: dict = Depends(verify_token)):
+def clear_pms_config(
+    clinic_id: str,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
     """
     Clear all PMS configuration for a clinic.
-    Deletes the clinic_pms_config row, sets pms_type='none' on clinics,
-    and removes all per-clinic secrets from SM.
+    Deletes the per-PMS config row and sets pms_type='none'. SM secrets are
+    intentionally left in place — manual cleanup once you're certain.
     """
-    clinic = _get_clinic_or_404(clinic_id)
-    require_write_access(clinic["instance_id"], caller)
+    clinic = _get_clinic_or_404(db, clinic_id)
+    require_write_access(clinic.instance_id, caller)
 
-    # Get current pms_type to know which secrets to clean up
-    pms = _get_pms_config(clinic_id)
-    if pms:
-        pms_type = pms["pms_type"]
-        # Delete SM secrets
-        secret_keys = _PMS_SECRET_KEYS.get(pms_type, [])
-        if secret_keys:
-            _delete_pms_secrets(clinic_id, secret_keys)
-
-        # Delete the config row
-        bq_client.query(
-            f"DELETE FROM {bq_table('clinic_pms_config')} WHERE clinic_id = @clinic_id",
-            job_config=bigquery.QueryJobConfig(query_parameters=[
-                bigquery.ScalarQueryParameter("clinic_id", "STRING", clinic_id)
-            ])
-        ).result()
-
-    # Reset pms_type on clinics
-    bq_update("clinics", {"clinic_id": clinic_id}, {"pms_type": "none"})
+    bp = db.get(ClinicBlueprintConfig, clinic_id)
+    if bp is not None:
+        db.delete(bp)
+    clinic.pms_type = "none"
 
     return {"status": "success", "clinic_id": clinic_id, "pms_type": "none"}

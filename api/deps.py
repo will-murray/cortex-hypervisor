@@ -5,9 +5,11 @@ from fastapi import Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import firebase_admin
 from firebase_admin import credentials, auth
-from google.api_core.exceptions import BadRequest
 from google.cloud import bigquery
+from sqlalchemy import select
 
+from services.db import session_scope
+from services.models import ClinicAdmin, Instance
 from services.secrets import get_secret
 
 PROJECT = "project-demo-2-482101"
@@ -25,66 +27,12 @@ bearer_scheme = HTTPBearer()
 
 
 def bq_table(table: str) -> str:
-    """Table reference for SQL queries (with backticks)."""
+    """BigQuery table reference for SQL queries (backtick-quoted, fully qualified).
+
+    Cloud SQL config tables are accessed via SQLAlchemy ORM (services/models.py).
+    This helper is for the BQ tables that remain (voice_agent_tickets in Users,
+    Blueprint_PHI dataset, ClinicData analytics tables)."""
     return f"`{PROJECT}.{DATASET}.{table}`"
-
-
-def bq_insert(table: str, rows: list[dict]):
-    """Insert rows using DML INSERT to avoid the streaming buffer, allowing immediate UPDATE/DELETE."""
-    for row in rows:
-        filtered = {k: v for k, v in row.items() if v is not None}
-        columns = ", ".join(filtered.keys())
-        placeholders = ", ".join(f"@{k}" for k in filtered.keys())
-        params = [bigquery.ScalarQueryParameter(k, "STRING", str(v)) for k, v in filtered.items()]
-        bq_client.query(
-            f"INSERT INTO {bq_table(table)} ({columns}) VALUES ({placeholders})",
-            job_config=bigquery.QueryJobConfig(query_parameters=params)
-        ).result()
-
-
-def bq_update(table: str, where: dict, updates: dict):
-    """Run a parameterized UPDATE. Raises 409 if the row is still in the streaming buffer."""
-    set_clause = ", ".join(f"{k} = @{k}" for k in updates)
-    where_clause = " AND ".join(f"{k} = @_w_{k}" for k in where)
-    params = [bigquery.ScalarQueryParameter(k, "STRING", v) for k, v in updates.items()]
-    params += [bigquery.ScalarQueryParameter(f"_w_{k}", "STRING", v) for k, v in where.items()]
-    try:
-        bq_client.query(
-            f"UPDATE {bq_table(table)} SET {set_clause} WHERE {where_clause}",
-            job_config=bigquery.QueryJobConfig(query_parameters=params)
-        ).result()
-    except BadRequest as e:
-        if "streaming buffer" in str(e):
-            raise HTTPException(status_code=409, detail="Record is still in streaming buffer.")
-        raise
-
-
-def bq_delete(table: str, where: dict):
-    """Run a parameterized DELETE. Raises 409 if the row is still in the streaming buffer."""
-    where_clause = " AND ".join(f"{k} = @_w_{k}" for k in where)
-    params = [bigquery.ScalarQueryParameter(f"_w_{k}", "STRING", v) for k, v in where.items()]
-    try:
-        bq_client.query(
-            f"DELETE FROM {bq_table(table)} WHERE {where_clause}",
-            job_config=bigquery.QueryJobConfig(query_parameters=params)
-        ).result()
-    except BadRequest as e:
-        if "streaming buffer" in str(e):
-            raise HTTPException(status_code=409, detail="Record is still in streaming buffer.")
-        raise
-
-
-def get_instance_id_or_404(table: str, id_col: str, id_val: str, detail: str = "Not found") -> str:
-    """Look up instance_id for an entity, raising 404 if not found."""
-    rows = list(bq_client.query(
-        f"SELECT instance_id FROM {bq_table(table)} WHERE {id_col} = @id",
-        job_config=bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ScalarQueryParameter("id", "STRING", id_val)
-        ])
-    ).result())
-    if not rows:
-        raise HTTPException(status_code=404, detail=detail)
-    return rows[0]["instance_id"]
 
 
 def verify_token(token: HTTPAuthorizationCredentials = Depends(bearer_scheme)) -> dict:
@@ -101,28 +49,35 @@ def verify_token(token: HTTPAuthorizationCredentials = Depends(bearer_scheme)) -
 
 
 def get_instance_id_for_uid(uid: str) -> str | None:
-    rows = list(bq_client.query(
-        f"SELECT instance_id FROM {bq_table('instances')} WHERE primary_contact_uid = @uid",
-        job_config=bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ScalarQueryParameter("uid", "STRING", uid)
-        ])
-    ).result())
-    return rows[0]["instance_id"] if rows else None
+    """Lookup the instance owned by the given Firebase uid. Reads Cloud SQL."""
+    with session_scope() as db:
+        return db.scalar(
+            select(Instance.instance_id).where(Instance.primary_contact_uid == uid)
+        )
 
 
 def _is_instance_member(instance_id: str, uid: str) -> bool:
-    """True if uid is the primary contact or linked in the users table for this instance."""
-    rows = list(bq_client.query(
-        f"SELECT 1 FROM {bq_table('instances')} WHERE instance_id = @instance_id AND primary_contact_uid = @uid "
-        f"UNION ALL "
-        f"SELECT 1 FROM {bq_table('users')} WHERE instance_id = @instance_id AND uid = @uid "
-        f"LIMIT 1",
-        job_config=bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ScalarQueryParameter("instance_id", "STRING", instance_id),
-            bigquery.ScalarQueryParameter("uid", "STRING", uid),
-        ])
-    ).result())
-    return bool(rows)
+    """
+    True if uid is the primary contact of the instance OR a clinic admin for it.
+
+    Reads Cloud SQL. The clinic_admins table replaces the legacy BQ users table —
+    same role, scoped to (uid, instance_id).
+    """
+    with session_scope() as db:
+        is_primary = db.scalar(
+            select(Instance.instance_id).where(
+                Instance.instance_id == instance_id,
+                Instance.primary_contact_uid == uid,
+            )
+        )
+        if is_primary:
+            return True
+        return db.scalar(
+            select(ClinicAdmin.id).where(
+                ClinicAdmin.instance_id == instance_id,
+                ClinicAdmin.uid == uid,
+            )
+        ) is not None
 
 
 def require_write_access(instance_id: str, caller: dict):

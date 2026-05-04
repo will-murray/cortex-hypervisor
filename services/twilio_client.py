@@ -5,21 +5,26 @@ One Twilio number is provisioned per clinic when voice agent is activated.
 Outbound calls from the VAPI agent use this number, optionally with the
 clinic's primary number verified as the caller ID.
 
-Environment variables:
-    TWILIO_ACCOUNT_SID
-    TWILIO_AUTH_TOKEN
+Credentials are read from Secret Manager:
+    twilio-account-sid
+    twilio-auth-token
 """
-import os
 from twilio.rest import Client
+
+from services.secrets import get_secret
 
 
 def _get_client() -> Client:
-    return Client(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"])
+    return Client(get_secret("twilio-account-sid"), get_secret("twilio-auth-token"))
 
 
-def buy_phone_number(area_code: str, country_code: str = "US") -> dict:
+def buy_phone_number(area_code: str, country_code: str) -> dict:
     """
     Purchase a local Twilio number for the given area code.
+
+    country_code is required (no default) because the wrong country silently
+    misroutes calls and triggers a paid Twilio purchase. Callers must pass the
+    clinic's country (resolved via services.locale.resolve).
 
     Returns:
         {"sid": str, "phone_number": str}  — phone_number is in E.164 format

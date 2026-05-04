@@ -1,107 +1,157 @@
 """
-Multi-campaign ID management per clinic.
+Multi-campaign ID management per clinic — backed by Cloud SQL.
 
-Clinics can have multiple Google Ads campaign IDs and multiple Invoca campaign IDs.
-These are stored in the clinic_campaigns table.
+The legacy `clinic_campaigns` BQ table (single table, `campaign_type`
+discriminator) has been split into two typed tables:
+    google_ads_campaigns  → (id, clinic_id, google_ads_campaign_id, active)
+    invoca_campaigns      → (id, clinic_id, invoca_campaign_id, active)
 
-The legacy single-value google_ads_campaign_id and invoca_campaign_id columns on the
-clinics table are retained for backwards compatibility but should not be used for new
-campaign associations — use this router instead.
+URL shape:
+    GET    /campaigns/{instance_id}                  → both types, all clinics
+    GET    /campaigns/{instance_id}/{clinic_id}      → both types, one clinic
+    POST   /campaigns/{clinic_id}  body{campaign_type, external_campaign_id, active}
+    DELETE /campaigns/{campaign_type}/{id}           → explicit type required
 """
-import uuid
 from fastapi import APIRouter, Depends, HTTPException
-from google.cloud import bigquery
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
-from api.deps import (
-    bq_client, bq_table, bq_insert, bq_delete,
-    verify_token, require_read_access, require_write_access,
-    get_instance_id_or_404,
-)
-from api.models import ClinicCampaign, ClinicCampaignCreate
+from api.deps import require_read_access, require_write_access, verify_token
+from api.models import ClinicCampaignCreate
+from services.db import get_session
+from services.models import Clinic, GoogleAdsCampaign, InvocaCampaign
+
 
 router = APIRouter()
 
 
+def _gads_dict(c: GoogleAdsCampaign) -> dict:
+    return {
+        "id": c.id,
+        "clinic_id": c.clinic_id,
+        "campaign_type": "google_ads",
+        "external_campaign_id": c.google_ads_campaign_id,
+        "active": bool(c.active),
+    }
+
+
+def _invoca_dict(c: InvocaCampaign) -> dict:
+    return {
+        "id": c.id,
+        "clinic_id": c.clinic_id,
+        "campaign_type": "invoca",
+        "external_campaign_id": c.invoca_campaign_id,
+        "active": bool(c.active),
+    }
+
+
 @router.get("/campaigns/{instance_id}")
-def list_campaigns_for_instance(instance_id: str, caller: dict = Depends(verify_token)):
+def list_campaigns_for_instance(
+    instance_id: str,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
     """List all campaign associations for every clinic in an instance."""
     require_read_access(instance_id, caller)
 
-    rows = list(bq_client.query(
-        f"SELECT * FROM {bq_table('clinic_campaigns')} WHERE instance_id = @instance_id",
-        job_config=bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ScalarQueryParameter("instance_id", "STRING", instance_id)
-        ])
-    ).result())
-    return [dict(r) for r in rows]
+    gads = db.scalars(
+        select(GoogleAdsCampaign)
+        .join(Clinic, Clinic.clinic_id == GoogleAdsCampaign.clinic_id)
+        .where(Clinic.instance_id == instance_id, Clinic.deleted_at.is_(None))
+    ).all()
+    invoca = db.scalars(
+        select(InvocaCampaign)
+        .join(Clinic, Clinic.clinic_id == InvocaCampaign.clinic_id)
+        .where(Clinic.instance_id == instance_id, Clinic.deleted_at.is_(None))
+    ).all()
+
+    return [_gads_dict(c) for c in gads] + [_invoca_dict(c) for c in invoca]
 
 
 @router.get("/campaigns/{instance_id}/{clinic_id}")
 def list_campaigns_for_clinic(
-    instance_id: str, clinic_id: str, caller: dict = Depends(verify_token)
+    instance_id: str,
+    clinic_id: str,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
 ):
     """List campaign associations for a specific clinic."""
     require_read_access(instance_id, caller)
 
-    rows = list(bq_client.query(
-        f"""
-        SELECT * FROM {bq_table('clinic_campaigns')}
-        WHERE instance_id = @instance_id AND clinic_id = @clinic_id
-        """,
-        job_config=bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ScalarQueryParameter("instance_id", "STRING", instance_id),
-            bigquery.ScalarQueryParameter("clinic_id", "STRING", clinic_id),
-        ])
-    ).result())
-    return [dict(r) for r in rows]
+    clinic = db.get(Clinic, clinic_id)
+    if not clinic or clinic.instance_id != instance_id or clinic.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Clinic not found")
+
+    gads = db.scalars(
+        select(GoogleAdsCampaign).where(GoogleAdsCampaign.clinic_id == clinic_id)
+    ).all()
+    invoca = db.scalars(
+        select(InvocaCampaign).where(InvocaCampaign.clinic_id == clinic_id)
+    ).all()
+
+    return [_gads_dict(c) for c in gads] + [_invoca_dict(c) for c in invoca]
 
 
 @router.post("/campaigns/{clinic_id}")
 def add_campaign(
-    clinic_id: str, body: ClinicCampaignCreate, caller: dict = Depends(verify_token)
+    clinic_id: str,
+    body: ClinicCampaignCreate,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
 ):
-    """Add a campaign ID association to a clinic."""
-    instance_id = get_instance_id_or_404("clinics", "clinic_id", clinic_id, "Clinic not found")
-    require_write_access(instance_id, caller)
+    """Add a campaign ID association to a clinic. Type-specific."""
+    clinic = db.get(Clinic, clinic_id)
+    if not clinic or clinic.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Clinic not found")
+    require_write_access(clinic.instance_id, caller)
 
-    # Prevent duplicate (clinic_id, campaign_type, external_campaign_id)
-    existing = list(bq_client.query(
-        f"""
-        SELECT id FROM {bq_table('clinic_campaigns')}
-        WHERE clinic_id = @clinic_id
-          AND campaign_type = @campaign_type
-          AND external_campaign_id = @external_campaign_id
-        """,
-        job_config=bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ScalarQueryParameter("clinic_id", "STRING", clinic_id),
-            bigquery.ScalarQueryParameter("campaign_type", "STRING", body.campaign_type),
-            bigquery.ScalarQueryParameter("external_campaign_id", "STRING", body.external_campaign_id),
-        ])
-    ).result())
-    if existing:
+    if body.campaign_type == "google_ads":
+        row = GoogleAdsCampaign(
+            clinic_id=clinic_id,
+            google_ads_campaign_id=body.external_campaign_id,
+            active=body.active,
+        )
+    else:  # invoca
+        row = InvocaCampaign(
+            clinic_id=clinic_id,
+            invoca_campaign_id=body.external_campaign_id,
+            active=body.active,
+        )
+
+    db.add(row)
+    try:
+        db.flush()
+    except IntegrityError:
+        # UNIQUE(clinic_id, external_id) — already linked.
         raise HTTPException(status_code=409, detail="Campaign already associated with this clinic")
 
-    campaign_id = str(uuid.uuid4())
-    row = {
-        "id": campaign_id,
-        "clinic_id": clinic_id,
-        "instance_id": instance_id,
-        "campaign_type": body.campaign_type,
-        "external_campaign_id": body.external_campaign_id,
-    }
-    if body.campaign_name:
-        row["campaign_name"] = body.campaign_name
-
-    bq_insert("clinic_campaigns", [row])
-    return {"status": "success", "id": campaign_id}
+    return {"status": "success", "id": row.id, "campaign_type": body.campaign_type}
 
 
-@router.delete("/campaigns/entry/{campaign_id}")
-def remove_campaign(campaign_id: str, caller: dict = Depends(verify_token)):
-    """Remove a campaign association by its ID."""
-    instance_id = get_instance_id_or_404(
-        "clinic_campaigns", "id", campaign_id, "Campaign not found"
-    )
-    require_write_access(instance_id, caller)
-    bq_delete("clinic_campaigns", {"id": campaign_id})
+@router.delete("/campaigns/{campaign_type}/{campaign_id}")
+def remove_campaign(
+    campaign_type: str,
+    campaign_id: int,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
+    """Remove a campaign association. Type must be 'google_ads' or 'invoca'."""
+    if campaign_type == "google_ads":
+        row = db.get(GoogleAdsCampaign, campaign_id)
+    elif campaign_type == "invoca":
+        row = db.get(InvocaCampaign, campaign_id)
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="campaign_type must be 'google_ads' or 'invoca'",
+        )
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    clinic = db.get(Clinic, row.clinic_id)
+    require_write_access(clinic.instance_id, caller)
+
+    db.delete(row)
     return {"status": "success"}
