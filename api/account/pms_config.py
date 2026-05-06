@@ -18,9 +18,9 @@ from sqlalchemy.orm import Session
 
 from api.deps import require_read_access, require_write_access, verify_token
 from api.models import PmsConfigSet
-from services.db import get_session
-from services.models import Clinic, ClinicBlueprintConfig
-from services.secrets import get_secret
+from api.core.db import get_session
+from api.core.orm import Clinic, ClinicBlueprintConfig
+from api.core.secrets import get_secret
 
 
 router = APIRouter()

@@ -27,10 +27,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from api.deps import bq_client, bq_table, require_write_access, verify_token
-from api.routers.blueprint import verify_vapi_secret
-from services.db import get_session
-from services.models import Clinic, ClinicVoiceAgentConfiguration, VoiceAgentCapability
-from services.voice_agent_capabilities import (
+from api.voice_agent.blueprint import verify_vapi_secret
+from api.core.db import get_session
+from api.core.orm import Clinic, ClinicVoiceAgentConfiguration, VoiceAgentCapability
+from api.voice_agent.capabilities import (
     CAPABILITY_METADATA,
     CAPABILITY_METADATA_BY_ID,
     is_pms_compatible,

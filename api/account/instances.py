@@ -7,9 +7,9 @@ from api.deps import (
     get_instance_id_for_uid, require_write_access, verify_token,
 )
 from api.models import InstanceUpdate, ProvisionRequest
-from services.db import get_session
-from services.models import Clinic, Instance
-from services.provisioning import provision_full_account
+from api.core.db import get_session
+from api.core.orm import Clinic, Instance
+from api.account.provisioning import provision_full_account
 
 
 router = APIRouter()

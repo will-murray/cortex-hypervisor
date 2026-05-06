@@ -16,9 +16,8 @@ to enforce at the unit-test layer.
 """
 import pytest
 from fastapi.testclient import TestClient
-
 from api import app
-from api.routers.blueprint import verify_vapi_secret
+from api.voice_agent.blueprint import verify_vapi_secret
 
 
 class _FakeJob:
@@ -47,7 +46,7 @@ class BQCapture:
 @pytest.fixture
 def capture(monkeypatch):
     cap = BQCapture()
-    monkeypatch.setattr("api.routers.blueprint.bq_client", cap)
+    monkeypatch.setattr("api.voice_agent.blueprint.bq_client", cap)
     app.dependency_overrides[verify_vapi_secret] = lambda: None
     yield cap
     app.dependency_overrides.clear()

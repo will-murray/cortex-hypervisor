@@ -11,7 +11,7 @@ Credentials are read from Secret Manager:
 """
 from twilio.rest import Client
 
-from services.secrets import get_secret
+from api.core.secrets import get_secret
 
 
 def _get_client() -> Client:

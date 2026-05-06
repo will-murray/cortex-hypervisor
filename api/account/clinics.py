@@ -15,9 +15,9 @@ from sqlalchemy.orm import Session
 
 from api.deps import require_read_access, require_write_access, verify_token
 from api.models import ClinicCreate, ClinicUpdate
-from services.db import get_session
-from services.models import Clinic, ClinicLocationDetails
-from services.provisioning import provision_clinic
+from api.core.db import get_session
+from api.core.orm import Clinic, ClinicLocationDetails
+from api.account.provisioning import provision_clinic
 
 
 router = APIRouter()

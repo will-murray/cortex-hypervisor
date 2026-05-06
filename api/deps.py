@@ -8,9 +8,9 @@ from firebase_admin import credentials, auth
 from google.cloud import bigquery
 from sqlalchemy import select
 
-from services.db import session_scope
-from services.models import ClinicAdmin, Instance
-from services.secrets import get_secret
+from api.core.db import session_scope
+from api.core.orm import ClinicAdmin, Instance
+from api.core.secrets import get_secret
 
 PROJECT = "project-demo-2-482101"
 DATASET = "Users"

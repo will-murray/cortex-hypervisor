@@ -3,9 +3,8 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routers import (
-    instance, clinics, voice_agent, pms_config, campaigns, blueprint,
-)
+from api.account import routers as account_routers
+from api.voice_agent import routers as voice_agent_routers
 
 app = FastAPI()
 
@@ -26,9 +25,5 @@ def hello():
     return {"message": "This is the Cortex Hypervisor"}
 
 
-app.include_router(instance.router)
-app.include_router(clinics.router)
-app.include_router(voice_agent.router)
-app.include_router(pms_config.router)
-app.include_router(campaigns.router)
-app.include_router(blueprint.router)
+for r in account_routers + voice_agent_routers:
+    app.include_router(r)

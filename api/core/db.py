@@ -33,7 +33,7 @@ Setup the instance once:
 Usage:
     from fastapi import Depends
     from sqlalchemy.orm import Session
-    from services.db import get_session
+    from api.core.db import get_session
 
     @router.get("/clinics/{clinic_id}")
     def get_clinic(clinic_id: str, db: Session = Depends(get_session)):

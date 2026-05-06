@@ -15,7 +15,7 @@ import uuid
 
 from sqlalchemy.orm import Session
 
-from services.models import (
+from api.core.orm import (
     Clinic,
     ClinicLocationDetails,
     ClinicVoiceAgentConfiguration,
@@ -98,7 +98,7 @@ def provision_full_account(
     Provision an instance + its clinics in a single transaction.
 
     The caller's session will commit on handler success or roll back on
-    exception (services.db.get_session does this automatically).
+    exception (api.core.db.get_session does this automatically).
 
     Returns:
         {

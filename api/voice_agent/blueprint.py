@@ -9,12 +9,18 @@ The /clinic-config endpoint IS for end users (Firebase auth) and lets admins
 see Blueprint appointment types, providers, and locations before activating
 the voice agent.
 
-Blueprint credentials are read from clinic_pms_config (non-secret config) +
-Secret Manager (API key) per request — never stored in environment variables.
+Blueprint credentials per request:
+  - Non-secret config (clinic_code, api_url, aws_url) → Cloud SQL
+    `clinic_blueprint_config`.
+  - Secrets (api_key) → Secret Manager, keyed by clinic_id:
+    ``clinic_{clinic_id}_blueprint_api_key``.
+  - Time zone → Cloud SQL `clinic_location_details.time_zone`.
+
+The patient/match endpoint queries `Blueprint_PHI.ClientDemographics` in
+BigQuery directly — that PHI table stays in BQ.
 
 Blueprint API base URL: https://{server}/{clinic_slug}/rest/
 """
-import json
 from datetime import datetime, timedelta
 from typing import Literal
 from zoneinfo import ZoneInfo
@@ -23,9 +29,12 @@ import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException
 from google.cloud import bigquery
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
-from api.deps import PROJECT, bq_client, bq_table, verify_token, require_read_access
-from services.secrets import get_secret
+from api.deps import PROJECT, bq_client, require_read_access, verify_token
+from api.core.db import get_session
+from api.core.orm import Clinic, ClinicBlueprintConfig
+from api.core.secrets import get_secret
 
 router = APIRouter(prefix="/blueprint")
 
@@ -40,75 +49,42 @@ def verify_vapi_secret(x_vapi_secret: str = Header(None)) -> None:
 
 # ── Blueprint credentials ─────────────────────────────────────────────────────
 
-def _get_blueprint_config(clinic_id: str) -> dict:
+def _get_blueprint_config(db: Session, clinic_id: str) -> dict:
     """
-    Fetch Blueprint config + API key + timezone for a clinic.
+    Resolve Blueprint config + API key + timezone for a clinic.
 
-    Non-secret config comes from clinic_pms_config.config JSON (fields:
-    clinic_code, api_url, aws_url, default_region).
-    API key comes from Secret Manager using the clinic-name-based naming:
-      <clinic_name>_BLUEPRINT_API_key
+    Reads:
+      - clinics + clinic_blueprint_config + clinic_location_details (Cloud SQL)
+      - clinic_{clinic_id}_blueprint_api_key (Secret Manager)
+
+    Returns dict with: clinic_name, api_url, clinic_code, api_key, timezone,
+    instance_id (for the admin access check).
     """
-    # Get PMS config + clinic name
-    rows = list(bq_client.query(
-        f"""
-        SELECT c.clinic_name, c.timezone, p.pms_type, p.config
-        FROM {bq_table('clinics')} c
-        JOIN {bq_table('clinic_pms_config')} p ON p.clinic_id = c.clinic_id
-        WHERE c.clinic_id = @clinic_id
-        """,
-        job_config=bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ScalarQueryParameter("clinic_id", "STRING", clinic_id)
-        ])
-    ).result())
+    clinic = db.get(Clinic, clinic_id)
+    if not clinic or clinic.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="Clinic not found")
 
-    if not rows:
-        raise HTTPException(status_code=400, detail="Clinic has no PMS configuration")
-
-    row = dict(rows[0])
-    if row.get("pms_type") != "blueprint":
+    if clinic.pms_type != "blueprint":
         raise HTTPException(status_code=400, detail="Clinic is not configured for Blueprint OMS")
 
-    config = json.loads(row["config"]) if row.get("config") else {}
-
-    if not config.get("api_url"):
+    bp = db.get(ClinicBlueprintConfig, clinic_id)
+    if not bp or not bp.api_url:
         raise HTTPException(status_code=400, detail="Blueprint config incomplete: api_url is missing")
 
-    # Fetch API key from SM
-    sm_prefix = row["clinic_name"].replace(" ", "_") + "_BLUEPRINT_"
     try:
-        api_key = get_secret(f"{sm_prefix}API_key")
+        api_key = get_secret(f"clinic_{clinic_id}_blueprint_api_key")
     except Exception:
         raise HTTPException(status_code=400, detail="Blueprint API key not found in Secret Manager")
 
+    location = clinic.location  # 1:1
     return {
-        "clinic_name": row["clinic_name"],
-        "api_url": config["api_url"],
-        "clinic_code": config.get("clinic_code"),
+        "clinic_name": clinic.clinic_name,
+        "api_url": bp.api_url,
+        "clinic_code": bp.clinic_code,
         "api_key": api_key,
-        "timezone": row.get("timezone"),
+        "timezone": location.time_zone if location else None,
+        "instance_id": clinic.instance_id,
     }
-
-
-def _get_full_clinic(clinic_id: str) -> dict:
-    """
-    Fetch full clinic row (for instance_id access control) + Blueprint config.
-    """
-    clinic_rows = list(bq_client.query(
-        f"SELECT instance_id, timezone FROM {bq_table('clinics')} WHERE clinic_id = @clinic_id",
-        job_config=bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ScalarQueryParameter("clinic_id", "STRING", clinic_id)
-        ])
-    ).result())
-    if not clinic_rows:
-        raise HTTPException(status_code=404, detail="Clinic not found")
-
-    clinic = dict(clinic_rows[0])
-
-    # Merge in Blueprint config
-    bp_config = _get_blueprint_config(clinic_id)
-    clinic.update(bp_config)
-    return clinic
 
 
 def _blueprint_base(config: dict) -> str:
@@ -175,11 +151,15 @@ class FindAvailableSlotsRequest(BaseModel):
 # ── Admin endpoint ────────────────────────────────────────────────────────────
 
 @router.get("/{clinic_id}/clinic-config")
-def get_clinic_config(clinic_id: str, caller: dict = Depends(verify_token)):
+def get_clinic_config(
+    clinic_id: str,
+    caller: dict = Depends(verify_token),
+    db: Session = Depends(get_session),
+):
     """
     Fetch Blueprint clinic configuration: appointment types, providers, locations.
     """
-    clinic = _get_full_clinic(clinic_id)
+    clinic = _get_blueprint_config(db, clinic_id)
     require_read_access(clinic["instance_id"], caller)
 
     base = _blueprint_base(clinic)
@@ -231,9 +211,10 @@ def lookup_patient(
     clinic_id: str,
     body: LookupPatientRequest,
     _: None = Depends(verify_vapi_secret),
+    db: Session = Depends(get_session),
 ):
     """CTI trigger: opens the patient's file in Blueprint for the receptionist."""
-    config = _get_blueprint_config(clinic_id)
+    config = _get_blueprint_config(db, clinic_id)
     base = _blueprint_base(config)
     user_id = _int_field(config, "user_id", default=1)
     callerid = "".join(c for c in body.caller_phone if c.isdigit())
@@ -260,9 +241,10 @@ def check_availability(
     clinic_id: str,
     body: AvailabilityRequest,
     _: None = Depends(verify_vapi_secret),
+    db: Session = Depends(get_session),
 ):
     """Return available appointment slots for a date range and event type."""
-    config = _get_blueprint_config(clinic_id)
+    config = _get_blueprint_config(db, clinic_id)
     base = _blueprint_base(config)
     location_id = _int_field(config, "location_id")
 
@@ -291,6 +273,7 @@ def search_availability(
     clinic_id: str,
     body: AvailabilitySearchRequest,
     _: None = Depends(verify_vapi_secret),
+    db: Session = Depends(get_session),
 ):
     """
     Search scheduled provider availability blocks in a date range.
@@ -301,7 +284,7 @@ def search_availability(
     tied to a specific event type; use this endpoint for broad "when does the
     clinic have capacity next week?" questions.
     """
-    config = _get_blueprint_config(clinic_id)
+    config = _get_blueprint_config(db, clinic_id)
     base = _blueprint_base(config)
 
     tz = ZoneInfo(config.get("timezone") or "America/Vancouver")
@@ -345,6 +328,7 @@ _DEFAULT_MINIMUM_ADVANCE_BOOKING_TIME = 30      # minutes
 def list_appointment_types(
     clinic_id: str,
     _: None = Depends(verify_vapi_secret),
+    db: Session = Depends(get_session),
 ):
     """
     Voice-agent capability: list the clinic's bookable appointment types.
@@ -357,7 +341,7 @@ def list_appointment_types(
     Strips: providers, locations, configuration knobs, requiredResourceTypeIds,
     description (often empty / verbose).
     """
-    config = _get_blueprint_config(clinic_id)
+    config = _get_blueprint_config(db, clinic_id)
     base = _blueprint_base(config)
 
     resp = httpx.get(
@@ -392,6 +376,7 @@ def find_available_slots(
     clinic_id: str,
     body: FindAvailableSlotsRequest,
     _: None = Depends(verify_vapi_secret),
+    db: Session = Depends(get_session),
 ):
     """
     Voice-agent capability: find concrete bookable time slots in a date range
@@ -406,7 +391,7 @@ def find_available_slots(
     agent's job is to capture preference; clinic staff confirm the actual
     provider / location at booking time.
     """
-    config = _get_blueprint_config(clinic_id)
+    config = _get_blueprint_config(db, clinic_id)
     base = _blueprint_base(config)
 
     tz = ZoneInfo(config.get("timezone") or "America/Vancouver")
@@ -464,9 +449,10 @@ def create_appointment(
     clinic_id: str,
     body: CreateAppointmentRequest,
     _: None = Depends(verify_vapi_secret),
+    db: Session = Depends(get_session),
 ):
     """Create an appointment in Blueprint OMS."""
-    config = _get_blueprint_config(clinic_id)
+    config = _get_blueprint_config(db, clinic_id)
     base = _blueprint_base(config)
     user_id = _int_field(config, "user_id", default=1)
     location_id = _int_field(config, "location_id")
