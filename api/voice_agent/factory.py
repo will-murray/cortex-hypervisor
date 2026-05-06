@@ -8,14 +8,6 @@ Reads from Cloud SQL ORM:
 The assembled config is a dict shaped for ``vapi.client.Vapi.assistants.create()``
 (snake_case kwargs). Voice settings, model, and transcriber model are hardcoded
 for v1 — revisit if a clinic asks for variation.
-
-Out of scope for this iteration (will be added when the transcript-analysis
-rebuild lands):
-  - FAQ knowledge base
-  - Approved script sections (Scope of Practice / Not Offered / Caller's Needs / Protocols)
-
-The system prompt below is a v1 placeholder — sections marked TODO will be
-populated once the user provides the canonical prompt structure.
 """
 from __future__ import annotations
 
@@ -29,6 +21,7 @@ from api.core.secrets import get_secret
 from api.voice_agent.capabilities import (
     CAPABILITY_REGISTRY,
     Capability,
+    PatientMatch,
     SubmitTicket,
 )
 from api.voice_agent.locale import resolve as resolve_locale
@@ -37,27 +30,11 @@ from api.voice_agent.locale import resolve as resolve_locale
 log = logging.getLogger(__name__)
 
 
-# Universal Information-Capture guidance. Not tied to any single capability —
-# every call, regardless of toggles, needs this framing.
-_INFORMATION_CAPTURE_FRAGMENT = """## Information Capture
-Based on the caller's intent, collect at minimum:
-- Caller's name (as spoken).
-- Callback phone number.
-- Reason for the call (in the caller's words).
-- For appointment requests: preferred day(s) and time window, new-vs-existing patient status.
-- Any clinical context the caller volunteers — but do not press for medical details beyond what's needed for triage."""
-
-
-_BEHAVIOUR_GUIDELINES = """## Behaviour Guidelines
-- Be warm, concise, and professional.
-- Speak in the caller's words; don't introduce clinical jargon.
-- If you don't know something, say so — never invent details about the clinic, services, or pricing.
-- You cannot confirm a specific appointment time. Capture preferences in the ticket; staff will follow up.
-- If the caller is distressed, acknowledge it before moving forward."""
-
-
 def build_first_message(clinic_name: str) -> str:
-    return f"You've reached {clinic_name}, how can I assist you today?"
+    return (
+        f"Thank you for calling {clinic_name}. My name is Emma, "
+        "your virtual hearing assistant. How can I help you today?"
+    )
 
 
 def _vapi_credential_id() -> str:
@@ -144,35 +121,124 @@ def _hours_block(clinic: Clinic) -> str:
     return f"## Hours of Operation\n{rendered}"
 
 
-def _booking_protocols(caps: list[Capability]) -> str:
-    """Compose BOOKING PROTOCOLS from capability fragments + universal capture.
+def _capability_by_id(caps: list[Capability], capability_id: str) -> Capability | None:
+    for c in caps:
+        if c.id == capability_id:
+            return c
+    return None
 
-    Layout:
-      <toggleable cap fragments, in instantiation order>
-      <Information Capture — universal>
-      <always-on cap fragments — SubmitTicket's 'Closing' goes last>
+
+def _identity_section(clinic: Clinic) -> str:
+    return (
+        "## Identity\n"
+        f"- You are the receptionist at {clinic.clinic_name}. "
+        "Your job is to help the right patients get in and to ensure every "
+        "patient who does come in is ready to take action on their hearing health."
+    )
+
+
+def _task_overview_section() -> str:
+    return (
+        "## Task Overview\n"
+        "- Your job is to follow the steps listed below and in order to assess "
+        "the caller's needs, answer questions and make bookings.\n"
+        "- In addition you must collect information in order for clinic staff "
+        "to have the sufficient context about the caller. The sections/bullets "
+        "marked with [info collection point] indicate where you need to keep "
+        "track of info.\n"
+        "- The intended conversation follows the flow detailed below. Everything "
+        "in quotation marks are phrases that you can say; anything else is instructions."
+    )
+
+
+def _opening_section(clinic: Clinic) -> str:
+    return (
+        "## Opening\n"
+        "- Opening messages\n"
+        f'  - "Thank you for calling {clinic.clinic_name}. My name is Emma, '
+        'your virtual hearing assistant. How can I help you today?" '
+        "<wait for user response>\n"
+        '  - "Who am I speaking with?" <wait for user response>\n'
+        f'  - "Nice to meet you [name]. I\'m really happy you called {clinic.clinic_name} '
+        'and I\'ll do my best to help." <wait for user response>\n'
+        '  - "I see you\'re calling from [number]. If I need to call you back '
+        'is this the best number for you?" <wait for user response>'
+    )
+
+
+def _caller_classification_section(caps: list[Capability]) -> str:
+    patient_match = _capability_by_id(caps, PatientMatch.id)
+    existing_lookup_block = (
+        patient_match.prompt_fragment if patient_match
+        else "_(Lookup Patient capability not enabled for this clinic.)_"
+    )
+    return (
+        "## Caller Classification\n"
+        "- Determine whether the caller is new to the clinic or an existing "
+        "patient, determine if they are calling on behalf of someone else.\n"
+        '  - "Have you visited our office before?" [info collection point] '
+        "<wait for user response>\n"
+        "- New Caller\n"
+        '  - "How did you hear about us?" [info collection point] '
+        "<wait for user response>\n"
+        '  - "Have you ever worn or tried hearing aids before?" '
+        "<wait for user response>\n"
+        '  - "Have you had a hearing test in the last 6 months?" '
+        "<wait for user response>\n"
+        "  - Proceed to the New Patient Flow.\n"
+        "- Existing Patient\n"
+        '  - "Let me find you in our system." → Use the Lookup Patient capability.\n'
+        f"\n{existing_lookup_block}\n"
+        "  - Proceed to the Existing Patient Flow."
+    )
+
+
+def _new_patient_flow_section() -> str:
+    # TODO: extend once the full New Patient Flow is provided.
+    return (
+        "## New Patient Flow\n"
+        '- "Can I ask what\'s been prompting you to look into your hearing '
+        'health right now?" <wait for user response>'
+    )
+
+
+def _existing_patient_flow_section() -> str:
+    # TODO: populate once the full Existing Patient Flow is provided.
+    return ""
+
+
+def _trailing_capability_blocks(
+    caps: list[Capability],
+    inlined_ids: set[str],
+) -> list[str]:
+    """Capability fragments not already inlined upstream.
+
+    Toggleable fragments first (in registry order), always-on last so
+    SubmitTicket's closing instructions sit at the very end of the prompt.
     """
-    toggleable = [c.prompt_fragment for c in caps if not c.always_on]
-    always_on = [c.prompt_fragment for c in caps if c.always_on]
-    return "\n\n".join(toggleable + [_INFORMATION_CAPTURE_FRAGMENT] + always_on)
+    toggleable = [
+        c.prompt_fragment for c in caps
+        if not c.always_on and c.id not in inlined_ids
+    ]
+    always_on = [
+        c.prompt_fragment for c in caps
+        if c.always_on and c.id not in inlined_ids
+    ]
+    return toggleable + always_on
 
 
 def build_system_prompt(clinic: Clinic, caps: list[Capability], locale: dict) -> str:
-    """
-    v1 placeholder. The canonical prompt structure (knowledge base layout, tone,
-    section ordering) is being defined — replace this body once the user
-    provides it. Until then, produces a working prompt that wires up the
-    capability fragments and clinic context.
-    """
-    address = clinic.address or "(address not configured)"
+    inlined_ids = {PatientMatch.id}
     parts = [
         locale["prompt_block"],
-        f"You are the friendly, professional receptionist at {clinic.clinic_name}.",
-        f"## Clinic\n- Name: {clinic.clinic_name}\n- Address: {address}",
+        _identity_section(clinic),
+        _task_overview_section(),
         _hours_block(clinic),
-        "# BOOKING PROTOCOLS",
-        _booking_protocols(caps),
-        _BEHAVIOUR_GUIDELINES,
+        _opening_section(clinic),
+        _caller_classification_section(caps),
+        _new_patient_flow_section(),
+        _existing_patient_flow_section(),
+        *_trailing_capability_blocks(caps, inlined_ids),
     ]
     return "\n\n".join(p for p in parts if p)
 
